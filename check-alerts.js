@@ -1,6 +1,4 @@
 // check-alerts.js
-// Revisa el inventario del Almacén TIENS y manda notificaciones push
-
 const webpush = require("web-push");
 
 const {
@@ -11,12 +9,11 @@ const {
   VAPID_PRIVATE_KEY,
 } = process.env;
 
-// ===== CORREO CONFIGURADO DIRECTAMENTE =====
 const VAPID_SUBJECT = 'mailto:edlop16@gmail.com';
 
 function required(name, val){
   if(!val){
-    console.error(`Falta la variable de entorno ${name}. Revisa los "Secrets" del repositorio en GitHub.`);
+    console.error(`Falta la variable de entorno ${name}`);
     process.exit(1);
   }
   return val;
@@ -28,7 +25,6 @@ required("VAPID_PUBLIC_KEY", VAPID_PUBLIC_KEY);
 required("VAPID_PRIVATE_KEY", VAPID_PRIVATE_KEY);
 
 const DB_URL = FIREBASE_DB_URL.replace(/\/$/, "");
-
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
 async function signInAnon(){
@@ -37,14 +33,14 @@ async function signInAnon(){
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify({returnSecureToken:true})
   });
-  if(!res.ok) throw new Error("No se pudo autenticar contra Firebase: "+await res.text());
+  if(!res.ok) throw new Error("No se pudo autenticar: "+await res.text());
   const data = await res.json();
   return data.idToken;
 }
 
 async function readSyncNode(idToken){
   const res = await fetch(`${DB_URL}/sync/${SYNC_CODE}.json?auth=${idToken}`);
-  if(!res.ok) throw new Error("No se pudo leer la base de datos: "+await res.text());
+  if(!res.ok) throw new Error("No se pudo leer: "+await res.text());
   return res.json();
 }
 
@@ -54,7 +50,7 @@ async function patchSyncNode(idToken, patch){
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify(patch)
   });
-  if(!res.ok) throw new Error("No se pudo actualizar la base de datos: "+await res.text());
+  if(!res.ok) throw new Error("No se pudo actualizar: "+await res.text());
 }
 
 function daysTo(iso){
@@ -70,7 +66,6 @@ function totalProducto(cod, lots){ return lots.filter(l=>l.cod===cod).reduce((s,
 function computeAlerts(state){
   const catalog = state.catalog || [];
   const lots = state.lots || [];
-
   const productosBajoReorden = catalog.filter(c=>{
     if(!c.puntoReorden || c.puntoReorden<=0) return false;
     return totalProducto(c.cod, lots) <= c.puntoReorden;
@@ -96,19 +91,20 @@ function buildHash({productosBajoReorden, lotesPorVencer, lotesVencidos}){
 }
 
 function buildMessage({productosBajoReorden, lotesPorVencer, lotesVencidos}){
-  const title = "Almacén TIENS PE902 — Alertas";
-  const body = `${productosBajoReorden.length} bajo reorden · ${lotesVencidos.length} vencidos · ${lotesPorVencer.length} por vencer (≤60d)`;
-  return {title, body, url: "./"};
+  return {
+    title: "Almacén TIENS PE902 — Alertas",
+    body: `${productosBajoReorden.length} bajo reorden · ${lotesVencidos.length} vencidos · ${lotesPorVencer.length} por vencer (≤60d)`,
+    url: "./"
+  };
 }
 
 async function main(){
-  console.log("Autenticando contra Firebase...");
+  console.log("Autenticando...");
   const idToken = await signInAnon();
-
   console.log("Leyendo inventario...");
   const node = await readSyncNode(idToken);
   if(!node || !node.state){
-    console.log("Todavía no hay inventario guardado. Nada que revisar.");
+    console.log("No hay inventario guardado.");
     return;
   }
   const state = JSON.parse(node.state);
@@ -117,21 +113,19 @@ async function main(){
   const hash = buildHash(alerts);
   const today = new Date().toISOString().slice(0,10);
 
-  const yaAvisadoHoy = node.lastNotifiedDate === today;
-  const cambioDesdeUltimoAviso = node.lastNotifiedHash !== hash;
-  const debeAvisar = total>0 && (cambioDesdeUltimoAviso || !yaAvisadoHoy);
-
   console.log(`Alertas: ${alerts.productosBajoReorden.length} bajo reorden, ${alerts.lotesVencidos.length} vencidos, ${alerts.lotesPorVencer.length} por vencer.`);
 
-  if(!debeAvisar){
-    console.log("Nada nuevo que avisar (ya se notificó hoy y no hay cambios). Fin.");
+  const yaAvisadoHoy = node.lastNotifiedDate === today;
+  const cambio = node.lastNotifiedHash !== hash;
+  if(total===0 || (!cambio && yaAvisadoHoy)){
+    console.log("Nada nuevo que avisar.");
     return;
   }
 
   const subs = node.pushSubscriptions || {};
   const deviceIds = Object.keys(subs);
   if(!deviceIds.length){
-    console.log("Hay alertas pero ningún dispositivo activó notificaciones push. Fin.");
+    console.log("Sin dispositivos suscritos.");
     await patchSyncNode(idToken, {lastNotifiedHash: hash, lastNotifiedDate: today});
     return;
   }
@@ -149,13 +143,12 @@ async function main(){
         patch["pushSubscriptions/"+deviceId] = null;
         expirados++;
       }else{
-        console.error(`No se pudo enviar a ${deviceId}:`, err.message||err);
+        console.error(`Error en ${deviceId}:`, err.message);
       }
     }
   }
-
   await patchSyncNode(idToken, patch);
-  console.log(`Listo. Enviadas: ${enviados}. Suscripciones vencidas limpiadas: ${expirados}.`);
+  console.log(`Enviadas: ${enviados}. Vencidas limpiadas: ${expirados}.`);
 }
 
 main().catch(err=>{
