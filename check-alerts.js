@@ -1,28 +1,24 @@
 // check-alerts.js
-// Revisa el inventario del Almacén TIENS (guardado en Firebase Realtime Database)
-// y manda notificaciones push a los dispositivos suscritos si hay:
-//   - productos en o bajo su punto de reorden
-//   - lotes vencidos
-//   - lotes que vencen en los próximos 60 días
-//
-// Pensado para correr como tarea programada (cron) en GitHub Actions — gratis,
-// sin servidor propio. No usa el SDK de administrador de Firebase: se autentica
-// igual que la app (inicio de sesión anónimo), así no hace falta tocar ninguna
-// regla de seguridad ni generar una cuenta de servicio.
+// Revisa el inventario del Almacén TIENS y manda notificaciones push
 
 const webpush = require("web-push");
 
 const {
   FIREBASE_API_KEY,
-  FIREBASE_DB_URL,   // ej: https://tu-proyecto-default-rtdb.firebaseio.com
-  SYNC_CODE,         // el mismo "código de sincronización" que usas en la app
+  FIREBASE_DB_URL,
+  SYNC_CODE,
   VAPID_PUBLIC_KEY,
   VAPID_PRIVATE_KEY,
-  VAPID_SUBJECT,     // ej: mailto:tu-correo@ejemplo.com
 } = process.env;
 
+// ===== CORREO CONFIGURADO DIRECTAMENTE =====
+const VAPID_SUBJECT = 'mailto:edlop16@gmail.com';
+
 function required(name, val){
-  if(!val){ console.error(`Falta la variable de entorno ${name}. Revisa los "Secrets" del repositorio en GitHub.`); process.exit(1); }
+  if(!val){
+    console.error(`Falta la variable de entorno ${name}. Revisa los "Secrets" del repositorio en GitHub.`);
+    process.exit(1);
+  }
   return val;
 }
 required("FIREBASE_API_KEY", FIREBASE_API_KEY);
@@ -30,7 +26,6 @@ required("FIREBASE_DB_URL", FIREBASE_DB_URL);
 required("SYNC_CODE", SYNC_CODE);
 required("VAPID_PUBLIC_KEY", VAPID_PUBLIC_KEY);
 required("VAPID_PRIVATE_KEY", VAPID_PRIVATE_KEY);
-required("VAPID_SUBJECT", VAPID_SUBJECT);
 
 const DB_URL = FIREBASE_DB_URL.replace(/\/$/, "");
 
@@ -42,7 +37,7 @@ async function signInAnon(){
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify({returnSecureToken:true})
   });
-  if(!res.ok) throw new Error("No se pudo autenticar contra Firebase (revisa FIREBASE_API_KEY): "+await res.text());
+  if(!res.ok) throw new Error("No se pudo autenticar contra Firebase: "+await res.text());
   const data = await res.json();
   return data.idToken;
 }
@@ -92,8 +87,6 @@ function computeAlerts(state){
 }
 
 function buildHash({productosBajoReorden, lotesPorVencer, lotesVencidos}){
-  // Firma simple: cambia si cambia el conjunto de alertas (no si solo cambia
-  // el texto del mensaje). Así no se reenvía la misma alerta cada hora.
   const parts = [
     ...productosBajoReorden.map(c=>"R:"+c.cod),
     ...lotesVencidos.map(l=>"V:"+l.id),
@@ -115,7 +108,7 @@ async function main(){
   console.log("Leyendo inventario...");
   const node = await readSyncNode(idToken);
   if(!node || !node.state){
-    console.log("Todavía no hay inventario guardado con ese código de sincronización. Nada que revisar.");
+    console.log("Todavía no hay inventario guardado. Nada que revisar.");
     return;
   }
   const state = JSON.parse(node.state);
@@ -138,7 +131,7 @@ async function main(){
   const subs = node.pushSubscriptions || {};
   const deviceIds = Object.keys(subs);
   if(!deviceIds.length){
-    console.log("Hay alertas pero todavía ningún dispositivo activó las notificaciones push. Fin.");
+    console.log("Hay alertas pero ningún dispositivo activó notificaciones push. Fin.");
     await patchSyncNode(idToken, {lastNotifiedHash: hash, lastNotifiedDate: today});
     return;
   }
@@ -153,7 +146,6 @@ async function main(){
       enviados++;
     }catch(err){
       if(err.statusCode===404 || err.statusCode===410){
-        // La suscripción ya no es válida (el usuario desinstaló, borró datos, etc.)
         patch["pushSubscriptions/"+deviceId] = null;
         expirados++;
       }else{
