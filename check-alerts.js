@@ -1,15 +1,14 @@
 // check-alerts.js
-const webpush = require("web-push");
+const nodemailer = require("nodemailer");
 
 const {
   FIREBASE_API_KEY,
   FIREBASE_DB_URL,
   SYNC_CODE,
-  VAPID_PUBLIC_KEY,
-  VAPID_PRIVATE_KEY,
+  GMAIL_USER,
+  GMAIL_APP_PASSWORD,
+  ALERT_EMAIL,
 } = process.env;
-
-const VAPID_SUBJECT = 'mailto:edlop16@gmail.com';
 
 function required(name, val){
   if(!val){
@@ -21,11 +20,19 @@ function required(name, val){
 required("FIREBASE_API_KEY", FIREBASE_API_KEY);
 required("FIREBASE_DB_URL", FIREBASE_DB_URL);
 required("SYNC_CODE", SYNC_CODE);
-required("VAPID_PUBLIC_KEY", VAPID_PUBLIC_KEY);
-required("VAPID_PRIVATE_KEY", VAPID_PRIVATE_KEY);
+required("GMAIL_USER", GMAIL_USER);
+required("GMAIL_APP_PASSWORD", GMAIL_APP_PASSWORD);
+required("ALERT_EMAIL", ALERT_EMAIL);
 
 const DB_URL = FIREBASE_DB_URL.replace(/\/$/, "");
-webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: GMAIL_USER,
+    pass: GMAIL_APP_PASSWORD,
+  },
+});
 
 async function signInAnon(){
   const res = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${FIREBASE_API_KEY}`, {
@@ -90,12 +97,46 @@ function buildHash({productosBajoReorden, lotesPorVencer, lotesVencidos}){
   return parts.join("|");
 }
 
-function buildMessage({productosBajoReorden, lotesPorVencer, lotesVencidos}){
-  return {
-    title: "Almacén TIENS PE902 — Alertas",
-    body: `${productosBajoReorden.length} bajo reorden · ${lotesVencidos.length} vencidos · ${lotesPorVencer.length} por vencer (≤60d)`,
-    url: "./"
+function escapeHtml(str){
+  return String(str).replace(/[&<>"']/g, ch => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+  }[ch]));
+}
+
+function buildEmail({productosBajoReorden, lotesPorVencer, lotesVencidos}){
+  const subject = `Almacén TIENS PE902 — ${productosBajoReorden.length} bajo reorden · ${lotesVencidos.length} vencidos · ${lotesPorVencer.length} por vencer`;
+
+  const section = (titulo, items, renderItem) => {
+    if(!items.length) return "";
+    return `<h3 style="margin:16px 0 8px;font-family:sans-serif;color:#222">${titulo} (${items.length})</h3>
+      <ul style="font-family:sans-serif;font-size:14px;color:#333;padding-left:20px;margin:0">
+        ${items.map(renderItem).join("")}
+      </ul>`;
   };
+
+  const html = `
+    <div style="font-family:sans-serif;max-width:600px">
+      <h2 style="color:#111">Almacén TIENS PE902 / JULIACA — Alertas de inventario</h2>
+      ${section("Productos bajo punto de reorden", productosBajoReorden, c =>
+        `<li>${escapeHtml(c.cod)} — ${escapeHtml(c.nombre||"")} (reorden: ${c.puntoReorden})</li>`)}
+      ${section("Lotes vencidos", lotesVencidos, l =>
+        `<li>${escapeHtml(l.cod)} — lote ${escapeHtml(l.lote||"")} — venció ${escapeHtml(l.vencimiento||"")}</li>`)}
+      ${section("Lotes por vencer (≤60 días)", lotesPorVencer, l =>
+        `<li>${escapeHtml(l.cod)} — lote ${escapeHtml(l.lote||"")} — vence ${escapeHtml(l.vencimiento||"")}</li>`)}
+      <p style="font-family:sans-serif;font-size:12px;color:#888;margin-top:20px">
+        Generado automáticamente por check-alerts.js
+      </p>
+    </div>`;
+
+  const text = [
+    "Almacén TIENS PE902 / JULIACA — Alertas de inventario",
+    "",
+    `Bajo reorden (${productosBajoReorden.length}): ${productosBajoReorden.map(c=>c.cod).join(", ")||"-"}`,
+    `Vencidos (${lotesVencidos.length}): ${lotesVencidos.map(l=>l.cod+"/"+l.lote).join(", ")||"-"}`,
+    `Por vencer (${lotesPorVencer.length}): ${lotesPorVencer.map(l=>l.cod+"/"+l.lote).join(", ")||"-"}`,
+  ].join("\n");
+
+  return {subject, html, text};
 }
 
 async function main(){
@@ -122,33 +163,23 @@ async function main(){
     return;
   }
 
-  const subs = node.pushSubscriptions || {};
-  const deviceIds = Object.keys(subs);
-  if(!deviceIds.length){
-    console.log("Sin dispositivos suscritos.");
-    await patchSyncNode(idToken, {lastNotifiedHash: hash, lastNotifiedDate: today});
-    return;
+  const {subject, html, text} = buildEmail(alerts);
+
+  try{
+    await transporter.sendMail({
+      from: `"Almacén TIENS PE902" <${GMAIL_USER}>`,
+      to: ALERT_EMAIL,
+      subject,
+      text,
+      html,
+    });
+    console.log("Correo enviado a", ALERT_EMAIL);
+  }catch(err){
+    console.error("Error enviando correo:", err.message);
+    process.exit(1);
   }
 
-  const payload = JSON.stringify(buildMessage(alerts));
-  const patch = {lastNotifiedHash: hash, lastNotifiedDate: today};
-  let enviados = 0, expirados = 0;
-
-  for(const deviceId of deviceIds){
-    try{
-      await webpush.sendNotification(subs[deviceId], payload);
-      enviados++;
-    }catch(err){
-      if(err.statusCode===404 || err.statusCode===410){
-        patch["pushSubscriptions/"+deviceId] = null;
-        expirados++;
-      }else{
-        console.error(`Error en ${deviceId}:`, err.message);
-      }
-    }
-  }
-  await patchSyncNode(idToken, patch);
-  console.log(`Enviadas: ${enviados}. Vencidas limpiadas: ${expirados}.`);
+  await patchSyncNode(idToken, {lastNotifiedHash: hash, lastNotifiedDate: today});
 }
 
 main().catch(err=>{
