@@ -1,13 +1,12 @@
 {
-  "name": "tdc902-alertas",
-  "version": "1.0.0",
-  "description": "Chequeo periódico de alertas de inventario (Almacén TIENS PE902) que manda notificaciones push gratis vía GitHub Actions.",
+  "name": "edgwr32-check-alerts",
+  "version": "2.0.0",
+  "description": "Chequeo diario de inventario TIENS PE902 y envio de alertas por correo (Gmail SMTP)",
   "main": "check-alerts.js",
   "scripts": {
-    "check": "node check-alerts.js"
+    "start": "node check-alerts.js"
   },
-  "license": "ISC",
   "dependencies": {
-    "web-push": "^3.6.7"
+    "nodemailer": "^6.9.14"
   }
 }
