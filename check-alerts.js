@@ -77,7 +77,8 @@ function leerEstado(node){
       lots: rama("lots") || [],
       settings: rama("settings") || {},
       solicitudes: rama("solicitudes") || [],
-      movimientos: Object.values(v2.movs || {}).sort((a,b)=>String(b.fecha).localeCompare(String(a.fecha))),
+      // Firebase devuelve los movimientos (claves numéricas) como un arreglo con huecos null: se filtran
+      movimientos: Object.values(v2.movs || {}).filter(m=>m && m.fecha).sort((a,b)=>String(b.fecha).localeCompare(String(a.fecha))),
       actualizadoEn: (v2.meta && v2.meta.updatedAt) ? new Date(v2.meta.updatedAt) : null,
       formato: "v2",
     };
