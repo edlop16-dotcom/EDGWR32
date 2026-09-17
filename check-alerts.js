@@ -60,8 +60,40 @@ async function patchSyncNode(idToken, patch){
   if(!res.ok) throw new Error("No se pudo actualizar: "+await res.text());
 }
 
+// Lee el inventario del nodo de sincronización.
+// Desde la app v89 el inventario se guarda POR RAMAS en sync/<código>/v2
+// (v2/catalog, v2/lots, v2/movs...). El nodo antiguo "state" quedó congelado
+// al migrar y ya no se actualiza: leerlo daba alertas con datos viejos.
+function leerEstado(node){
+  const v2 = node && node.v2;
+  if(v2 && v2.catalog && v2.lots){
+    const rama = (r)=>{
+      const n = v2[r];
+      if(!n) return null;
+      return typeof n.d === "string" ? JSON.parse(n.d) : n.d;
+    };
+    return {
+      catalog: rama("catalog") || [],
+      lots: rama("lots") || [],
+      settings: rama("settings") || {},
+      solicitudes: rama("solicitudes") || [],
+      movimientos: Object.values(v2.movs || {}).sort((a,b)=>String(b.fecha).localeCompare(String(a.fecha))),
+      actualizadoEn: (v2.meta && v2.meta.updatedAt) ? new Date(v2.meta.updatedAt) : null,
+      formato: "v2",
+    };
+  }
+  if(node && node.state){
+    const st = JSON.parse(node.state); // respaldo: formato antiguo (app anterior a v89)
+    st.actualizadoEn = null;
+    st.formato = "antiguo";
+    return st;
+  }
+  return null;
+}
+
 const DIAS_RETRASO_SOLICITUD = 4; // días de margen tras la fecha estimada de llegada
 const DIAS_STOCK_MUERTO = 30;     // días sin movimiento para considerar stock muerto
+const HORAS_DATOS_VIEJOS = 48;    // si el inventario no se actualiza en este tiempo, se avisa en el correo
 
 function daysTo(iso){
   if(!iso) return null;
@@ -75,7 +107,8 @@ function daysSince(iso){
   return d===null ? null : -d;
 }
 function esFaltante(l){ return (l.lote||"").trim().toUpperCase() === "FALTANTE"; }
-function totalLot(l){ return (l.almacen||0)+(l.repisa||0)+(l.exhibicion||0); }
+// Igual que en la app: Almacén + Repisa + Exhibición + Pasillo
+function totalLot(l){ return (l.almacen||0)+(l.repisa||0)+(l.exhibicion||0)+(l.pasillo||0); }
 function totalProducto(cod, lots){ return lots.filter(l=>l.cod===cod).reduce((s,l)=>s+totalLot(l),0); }
 // Total real: excluye lotes FALTANTE (son un marcador de compra pendiente, no stock físico).
 function totalRealProducto(cod, lots){ return lots.filter(l=>l.cod===cod && !esFaltante(l)).reduce((s,l)=>s+totalLot(l),0); }
@@ -153,9 +186,21 @@ function escapeHtml(str){
   }[ch]));
 }
 
-function buildEmail({productosBajoReorden, lotesPorVencer, lotesVencidos, productosStockCero, lotesFaltanteSinResolver, solicitudesAtrasadas, productosStockMuerto}){
+function fechaPeru(d){
+  return d ? d.toLocaleString("es-PE", {timeZone:"America/Lima", day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit"}) : "desconocida";
+}
+
+function buildEmail(alerts, meta){
+  const {productosBajoReorden, lotesPorVencer, lotesVencidos, productosStockCero, lotesFaltanteSinResolver, solicitudesAtrasadas, productosStockMuerto} = alerts;
   const criticos = productosStockCero.length + solicitudesAtrasadas.length;
-  const subject = `Almacén TIENS PE902 — ${criticos>0 ? `⚠ ${criticos} crítico(s) · `: ""}${productosBajoReorden.length} bajo reorden · ${lotesVencidos.length} vencidos`;
+  const horasSinActualizar = meta.actualizadoEn ? (Date.now() - meta.actualizadoEn.getTime())/3600000 : null;
+  const datosViejos = horasSinActualizar === null || horasSinActualizar > HORAS_DATOS_VIEJOS;
+  const avisoDatos = datosViejos
+    ? (horasSinActualizar === null
+        ? "⚠ No se pudo confirmar la fecha de los datos (formato antiguo)"
+        : `⚠ El inventario no se actualiza hace ${Math.floor(horasSinActualizar/24)} día(s)`)
+    : "";
+  const subject = `Almacén TIENS PE902 — ${datosViejos ? "⚠ datos sin actualizar · " : ""}${criticos>0 ? `⚠ ${criticos} crítico(s) · `: ""}${productosBajoReorden.length} bajo reorden · ${lotesVencidos.length} vencidos`;
 
   const section = (titulo, items, renderItem) => {
     if(!items.length) return "";
@@ -168,12 +213,14 @@ function buildEmail({productosBajoReorden, lotesPorVencer, lotesVencidos, produc
   const html = `
     <div style="font-family:sans-serif;max-width:600px">
       <h2 style="color:#111">Almacén TIENS PE902 / JULIACA — Alertas de inventario</h2>
+      <p style="font-family:sans-serif;font-size:13px;color:#555;margin:0 0 8px">Inventario actualizado: <b>${escapeHtml(fechaPeru(meta.actualizadoEn))}</b> (hora Perú)</p>
+      ${avisoDatos ? `<p style="font-family:sans-serif;font-size:13px;color:#b00020;font-weight:bold;margin:0 0 8px">${escapeHtml(avisoDatos)} — revisa que la app esté sincronizando.</p>` : ""}
       ${section("🔴 Stock en cero (rotura total)", productosStockCero, c =>
         `<li>${escapeHtml(c.cod)} — ${escapeHtml(c.nombre||"")}</li>`)}
       ${section("🔴 Solicitudes de ingreso atrasadas (+"+DIAS_RETRASO_SOLICITUD+" días)", solicitudesAtrasadas, s =>
         `<li>${escapeHtml(s.numero||s.id)} — ${escapeHtml(s.proveedor||"s/proveedor")} — esperada ${escapeHtml(s.fecha||"")} — estado: ${escapeHtml(s.estado||"")}</li>`)}
       ${section("Productos bajo punto de reorden", productosBajoReorden, c =>
-        `<li>${escapeHtml(c.cod)} — ${escapeHtml(c.nombre||"")} (reorden: ${c.puntoReorden})</li>`)}
+        `<li>${escapeHtml(c.cod)} — ${escapeHtml(c.nombre||"")} — stock: ${totalProducto(c.cod, meta.lots)} (reorden: ${c.puntoReorden})</li>`)}
       ${section("Lotes vencidos", lotesVencidos, l =>
         `<li>${escapeHtml(l.cod)} — lote ${escapeHtml(l.lote||"")} — venció ${escapeHtml(l.vencimiento||"")}</li>`)}
       ${section("Lotes por vencer (≤60 días)", lotesPorVencer, l =>
@@ -189,10 +236,12 @@ function buildEmail({productosBajoReorden, lotesPorVencer, lotesVencidos, produc
 
   const text = [
     "Almacén TIENS PE902 / JULIACA — Alertas de inventario",
+    `Inventario actualizado: ${fechaPeru(meta.actualizadoEn)} (hora Perú)`,
+    avisoDatos,
     "",
     `Stock en cero (${productosStockCero.length}): ${productosStockCero.map(c=>c.cod).join(", ")||"-"}`,
     `Solicitudes atrasadas (${solicitudesAtrasadas.length}): ${solicitudesAtrasadas.map(s=>s.numero||s.id).join(", ")||"-"}`,
-    `Bajo reorden (${productosBajoReorden.length}): ${productosBajoReorden.map(c=>c.cod).join(", ")||"-"}`,
+    `Bajo reorden (${productosBajoReorden.length}): ${productosBajoReorden.map(c=>c.cod+" ("+totalProducto(c.cod, meta.lots)+"/"+c.puntoReorden+")").join(", ")||"-"}`,
     `Vencidos (${lotesVencidos.length}): ${lotesVencidos.map(l=>l.cod+"/"+l.lote).join(", ")||"-"}`,
     `Por vencer (${lotesPorVencer.length}): ${lotesPorVencer.map(l=>l.cod+"/"+l.lote).join(", ")||"-"}`,
     `FALTANTE sin resolver (${lotesFaltanteSinResolver.length}): ${lotesFaltanteSinResolver.map(l=>l.cod).join(", ")||"-"}`,
@@ -207,11 +256,12 @@ async function main(){
   const idToken = await signInAnon();
   console.log("Leyendo inventario...");
   const node = await readSyncNode(idToken);
-  if(!node || !node.state){
+  const state = leerEstado(node);
+  if(!state){
     console.log("No hay inventario guardado.");
     return;
   }
-  const state = JSON.parse(node.state);
+  console.log(`Formato de datos: ${state.formato} · inventario actualizado: ${fechaPeru(state.actualizadoEn)} (hora Perú) · ${(state.catalog||[]).length} productos, ${(state.lots||[]).length} lotes, ${(state.movimientos||[]).length} movimientos`);
   const alerts = computeAlerts(state);
   const total = alerts.productosBajoReorden.length + alerts.lotesPorVencer.length + alerts.lotesVencidos.length
     + alerts.productosStockCero.length + alerts.lotesFaltanteSinResolver.length
@@ -228,7 +278,7 @@ async function main(){
     return;
   }
 
-  const {subject, html, text} = buildEmail(alerts);
+  const {subject, html, text} = buildEmail(alerts, {actualizadoEn: state.actualizadoEn, lots: state.lots || []});
 
   try{
     await transporter.sendMail({
